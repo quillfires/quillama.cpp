@@ -1,3 +1,46 @@
+# quillama.cpp: ik_llama.cpp tuned for CPU-only servers
+
+quillama.cpp is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) with changes for
+running models on a server without a GPU, such as a VPS with lots of RAM and an SSD. Everything ik
+supports keeps working; the changes below are on top:
+
+- **JSON output follows the requested schema.** `response_format: {"type": "json_object"}` was not
+  enforced at all in ik_llama.cpp (upstream llama.cpp does enforce it), and two smaller gaps let
+  output escape the schema. Grammar-constrained sampling is also 1.7× faster, with an identical
+  token mask.
+- **Faster generation on AVX2 servers** (AMD EPYC, Intel without AVX-512): +29% over a hand-tuned
+  ik_llama.cpp on a Qwen3-30B-A3B-shaped MoE, from run-time repack by default, huge pages for the
+  repacked weights, MoE decode work split and faster AVX2 flash attention at long context.
+- **Faster JSON-schema generation**: about 2.3× ik_llama.cpp. The output layer is computed only for
+  the tokens the grammar allows (exact), and grammar-forced text is drafted and verified in one
+  batch, adaptively.
+- **Prompt processing on Intel AMX** (Sapphire Rapids and newer Xeons, common on cloud VPS): BF16
+  tile kernels for dense and MoE matmuls and for flash attention, with 2048-token micro-batches.
+  2.1-2.8× faster prompts on a dense model and 1.7-2.7× on a MoE model than a hand-tuned
+  ik_llama.cpp in our measurements; the gap grows with the context.
+- **Models larger than RAM** keep `mmap` and stream from SSD: read-ahead of the selected MoE
+  experts, and AirLLM-style layer-ahead read-ahead of the dense weights (+11% generation for a
+  dense model under a memory cap).
+- **`llama-quantize` reads upstream GGUF importance matrices** (e.g. unsloth's `imatrix_unsloth.gguf`)
+  as well as ik's `.dat`, so ik's IQ*_K types can be made with published calibration data.
+- **Hybrid models (Qwen3-Next, Qwen3.5) and Gemma with `--swa-compress` keep a context checkpoint at
+  chat message boundaries**, so a request that only changes text after the system prompt resumes
+  there instead of re-processing everything: 2–3× faster on such requests once the server has seen
+  where a prompt family diverges, never an extra batch (`--ctx-checkpoints-messages`, idea from Magnitude).
+- Server robustness: prompt-prefix reuse checked by a regression test, hardened slot
+  save/restore, no draft tokens accepted after end-of-generation. Tests cover all of the above,
+  including upstream llama.cpp's grammar / JSON-schema suite.
+
+```bash
+./scripts/quill-build-cpu.sh
+./build/bin/llama-server -m model.gguf -t $(nproc) -c 16384 --jinja
+```
+
+Details, measurements, flags and limits: **[docs/quillama.md](docs/quillama.md)**. Everything below
+is ik_llama.cpp's README.
+
+---
+
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)

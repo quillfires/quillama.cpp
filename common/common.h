@@ -394,6 +394,8 @@ struct gpt_params {
     int32_t banned_n                 =  1; // number of tokens that are banned in the phrase
     size_t n_buffer                  =  0; // number of token buffers for string ban
     bool can_ban_phrases             = true;  // whether to ban strings
+    int32_t grammar_draft_n          = 16;    // quillama.cpp: max grammar-forced tokens drafted per step (0 = off)
+    int32_t grammar_sparse_logits    = 4096;  // quillama.cpp: compute only the allowed logits when the grammar allows at most N tokens (0 = off)
 
     std::vector<std::vector<std::tuple<
         uint32_t        // lower codepoint
@@ -479,6 +481,8 @@ struct gpt_params {
     bool batch_warmup      = false; // batch warmup run
     bool check_tensors     = false; // validate tensor data
     bool repack_tensors    = false; // repack tensors if interleaved variant is available
+    bool repack_explicit   = false; // quillama: -rtr/--no-repack/--no-mmap given, so no automatic choice
+    bool ubatch_explicit   = false; // quillama: -ub given, so no automatic choice
     bool use_thp           = false; // use transparent huge pages (linux only)
     bool validate_quants   = false; // if true, check for NaNs while loading the model
     bool only_active_exps  = true;  // if true, offload only active experts (relevant only for hybrid CPU/GPU)
@@ -587,6 +591,7 @@ struct gpt_params {
     int32_t ctx_checkpoint_ram_live = 2;      // max checkpoints with resident data when spill is on
     int32_t ctx_checkpoints_interval = 512;   // minimum number of tokens between each context checkpoints
     int32_t ctx_checkpoints_tolerance = 5;    // the number of tokens before the full prompt to create the checkpoint
+    int32_t ctx_checkpoints_msg = 2;          // chat requests: also checkpoint at the end of the leading system block and at the starts of the last N messages (0 = off)
     common_checkpoint_eviction ctx_checkpoint_eviction = COMMON_CHECKPOINT_EVICTION_VARIANCE;
     int32_t cache_ram_mib = 8192;   // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram

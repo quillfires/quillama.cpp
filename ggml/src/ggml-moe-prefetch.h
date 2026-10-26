@@ -27,6 +27,11 @@ void ggml_moe_prefetch_new_epoch(void);
 // host-visible) and enqueues the selected expert ranges of src weights.
 void ggml_moe_prefetch_node(const struct ggml_tensor * node);
 
+// quillama.cpp: low-priority enqueue of the experts a router lookahead predicts (ids) for the
+// next layer, under a separate ticket so the demand enqueue still runs; falls back to
+// madvise(MADV_WILLNEED) when the engine is off
+void ggml_moe_prefetch_predicted(const struct ggml_tensor * w, const struct ggml_tensor * ids);
+
 // full-tensor lookahead enqueue (low priority), e.g. for prompt processing
 // where the next layer's experts are needed in bulk.
 void ggml_moe_prefetch_tensor(const struct ggml_tensor * w);
@@ -46,6 +51,14 @@ void ggml_moe_prefetch_cold(const struct ggml_tensor * w);
 // scheduler hook did not run for this epoch (pure-CPU graphs); falls back to
 // madvise(MADV_WILLNEED) when the engine is off.
 void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor * node, int ith);
+
+// quillama.cpp: AirLLM-style layer-ahead streaming for dense weights. Called by thread 0 before
+// each node of a CPU graph; keeps the mmap-backed weights of the nodes ahead (up to a byte window)
+// hinted with MADV_WILLNEED, so the next layers' attention/FFN pages stream in from storage while
+// the current layer computes. No-op unless the prefetch engine is on (model kept in mmap because it
+// does not fit in RAM). QUILL_LAYER_PREFETCH_MB sets the window (0 = off); the common argument
+// parser sets it to half the available memory, otherwise it defaults to 256.
+void ggml_quill_layer_prefetch(const struct ggml_cgraph * graph, int node_n);
 
 #ifdef __cplusplus
 }

@@ -1021,6 +1021,137 @@ void gpt_params_parse_from_env(gpt_params & params) {
 
 }
 
+// quillama.cpp: on a CPU-only run, repack the weights into ik's row-interleaved layouts (-rtr)
+// when the model fits comfortably in RAM: token generation is 25-40% faster and the AMX prompt
+// path handles the repacked types. Models that do not fit keep mmap, so their experts can still be
+// streamed from SSD. Disable with --no-repack (or force with -rtr).
+static size_t quill_model_file_bytes(const std::string & path) {
+#ifndef __linux__
+    (void) path;
+    return 0;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    size_t total = st.st_size;
+    // split GGUF: <name>-00001-of-0000N.gguf
+    static const std::regex re("^(.*)-00001-of-([0-9]{5})\\.gguf$");
+    std::smatch m;
+    if (std::regex_match(path, m, re)) {
+        const int n = std::stoi(m[2].str());
+        for (int i = 2; i <= n; ++i) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "-%05d-of-%05d.gguf", i, n);
+            if (stat((m[1].str() + buf).c_str(), &st) == 0) total += st.st_size;
+        }
+    }
+    return total;
+#endif
+}
+
+#ifdef __linux__
+// first unsigned number in a file, 0 when missing or not a number (e.g. cgroup v2 "max")
+static size_t quill_read_size(const char * path) {
+    FILE * f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long v = 0;
+    const int n = fscanf(f, "%llu", &v);
+    fclose(f);
+    return n == 1 ? (size_t) v : 0;
+}
+#endif
+
+// memory this process can still use: MemAvailable, capped by the cgroup limit of a container
+// (inside Docker/Podman /proc/meminfo shows the host's memory, not the container's mem_limit)
+static size_t quill_mem_available_bytes() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) break;
+    }
+    fclose(f);
+    size_t avail = kb*1024;
+    // this process' cgroup: "0::/path" (v2) or "N:...memory...:/path" (v1); "/" inside a container
+    std::string v2_path, v1_path;
+    if (FILE * cf = fopen("/proc/self/cgroup", "r")) {
+        char cl[1024];
+        while (fgets(cl, sizeof(cl), cf)) {
+            std::string ln(cl);
+            while (!ln.empty() && (ln.back() == '\n' || ln.back() == '\r')) ln.pop_back();
+            const size_t c1 = ln.find(':'), c2 = c1 == std::string::npos ? c1 : ln.find(':', c1 + 1);
+            if (c2 == std::string::npos) continue;
+            const std::string ctrl = ln.substr(c1 + 1, c2 - c1 - 1), path = ln.substr(c2 + 1);
+            if (ln.compare(0, 2, "0:") == 0 && ctrl.empty()) v2_path = path;
+            for (const auto & tok : string_split<std::string>(ctrl, ',')) if (tok == "memory") v1_path = path;
+        }
+        fclose(cf);
+    }
+    std::vector<std::pair<std::string, std::string>> cg;   // (limit file, usage file), most specific first
+    if (!v1_path.empty()) {
+        cg.push_back({"/sys/fs/cgroup/memory" + v1_path + "/memory.limit_in_bytes", "/sys/fs/cgroup/memory" + v1_path + "/memory.usage_in_bytes"});
+    }
+    if (!v2_path.empty()) {
+        cg.push_back({"/sys/fs/cgroup" + v2_path + "/memory.max", "/sys/fs/cgroup" + v2_path + "/memory.current"});
+    }
+    cg.push_back({"/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"});
+    cg.push_back({"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"});
+    for (const auto & c : cg) {
+        const size_t limit = quill_read_size(c.first.c_str());
+        if (limit == 0 || limit >= (size_t(1) << 60)) continue;   // missing or unlimited
+        const size_t usage = quill_read_size(c.second.c_str());
+        const size_t room  = limit > usage ? limit - usage : 0;
+        avail = std::min(avail, room);
+        break;
+    }
+    return avail;
+#else
+    return 0;
+#endif
+}
+
+extern "C" bool quill_amx_available(void);
+
+// quillama.cpp: with AMX, larger micro-batches keep the tile units busy (each MoE expert sees more
+// tokens per batch); ik_llama.cpp's kernels gain nothing from them. Measured on a 4-core VM:
+// MoE pp2048 648 -> 865 t/s going from -ub 512 to -ub 2048. Only for CPU-only runs without -ub.
+static void quill_auto_ubatch(gpt_params & params) {
+    if (params.ubatch_explicit || params.n_ubatch != 512 || getenv("LLAMA_ARG_UBATCH")) return;
+    if (llama_supports_gpu_offload() && params.n_gpu_layers != 0) return;
+    if (!quill_amx_available()) return;
+    params.n_ubatch = std::min<int32_t>(2048, std::max<int32_t>(params.n_batch, 512));
+}
+
+static void quill_auto_repack(gpt_params & params) {
+    if (params.repack_explicit || params.repack_tensors || !params.use_mmap || params.model.empty()) return;
+    if (llama_supports_gpu_offload() && params.n_gpu_layers != 0) return;
+    if (!params.tensor_buft_overrides.empty()) return;
+    if (!params.lora_adapters.empty() || !params.control_vectors.empty()) return;   // adapters expect the original layout
+    const size_t model_bytes = quill_model_file_bytes(params.model);
+    const size_t avail       = quill_mem_available_bytes();
+    if (model_bytes == 0 || avail == 0) return;
+    if (model_bytes < avail/10*7) {
+        params.repack_tensors = true;
+        params.use_mmap       = false;
+        fprintf(stderr, "quillama: model (%.1f GiB) fits in RAM (%.1f GiB available): run-time repack enabled (--no-repack to disable)\n",
+                model_bytes/1073741824.0, avail/1073741824.0);
+    } else {
+        // stream MoE experts from SSD: read-ahead of the selected experts plus the router lookahead
+        params.prefetch_experts = true;
+        // and the dense weights of the layers ahead (AirLLM-style layer streaming): a read-ahead
+        // window of half the available memory measured best under a memory cap (+19% at ~60%,
+        // losing again near 85% when it evicts pages that are still needed)
+        if (!getenv("QUILL_LAYER_PREFETCH_MB")) {
+            const size_t window_mb = std::max<size_t>(32, avail/2 >> 20);
+            setenv("QUILL_LAYER_PREFETCH_MB", std::to_string(window_mb).c_str(), 0);
+        }
+        fprintf(stderr, "quillama: model (%.1f GiB) does not fit comfortably in RAM (%.1f GiB available): keeping mmap, "
+                "no run-time repack, MoE expert prefetch from storage enabled\n",
+                model_bytes/1073741824.0, avail/1073741824.0);
+    }
+}
+
 bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
     gpt_params_parse_from_env(params);
     const auto params_org = params; // the example can modify the default params
@@ -1039,6 +1170,9 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
 
     // resolve the CPU affinity once, so the list stays alive until the context is created
     params.cpu_affinity = cpu_affinity_resolve(params.cpu_affinity, params.cpu_affinity_auto);
+
+    quill_auto_repack(params);
+    quill_auto_ubatch(params);
 
     return true;
 }
@@ -1766,6 +1900,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-ub" || arg == "--ubatch-size") {
         CHECK_ARG
         params.n_ubatch = std::stoi(argv[i]);
+        params.ubatch_explicit = true;
         return true;
     }
     if (arg == "--keep") {
@@ -2484,11 +2619,28 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "-nmm" || arg == "--no-mmap") {
         params.use_mmap = false;
+        params.repack_explicit = true;
         return true;
     }
     if (arg == "-rtr" || arg == "--run-time-repack") {
         params.repack_tensors = true;
         params.use_mmap = false;
+        params.repack_explicit = true;
+        return true;
+    }
+    if (arg == "--moe-lookahead") {
+        // read by the graph builder (src/llama-build-context.cpp)
+#ifdef _WIN32
+        _putenv_s("QUILL_MOE_LOOKAHEAD", "1");
+#else
+        setenv("QUILL_MOE_LOOKAHEAD", "1", 1);
+#endif
+        params.prefetch_experts = true;
+        return true;
+    }
+    if (arg == "-nrtr" || arg == "--no-repack") {
+        params.repack_tensors = false;
+        params.repack_explicit = true;
         return true;
     }
     if (arg == "-thp" || arg == "--transparent-huge-pages") {
@@ -2783,6 +2935,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--grammar") {
         CHECK_ARG
             sparams.grammar = { COMMON_GRAMMAR_TYPE_USER, argv[i] };
+        return true;
+    }
+    if (arg == "--grammar-sparse-logits") {
+        CHECK_ARG
+        params.grammar_sparse_logits = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--grammar-draft") {
+        CHECK_ARG
+        params.grammar_draft_n = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--grammar-file") {
@@ -3124,6 +3286,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.ctx_checkpoints_tolerance = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "-ctx-ckpt-msg" || arg == "--ctx-checkpoints-messages") {
+        CHECK_ARG
+        params.ctx_checkpoints_msg = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--ctx-ckpt-spill-dir" || arg == "--ctx-checkpoints-spill-dir") {
         CHECK_ARG
         params.ctx_checkpoint_spill_dir = argv[i];
@@ -3352,6 +3519,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "--ctx-ckpt-live-n N, --ctx-checkpoints-live-n N",           "max checkpoints with resident data when spill is on (default: %d)",params.ctx_checkpoint_ram_live});
     options.push_back({ "*",           "-ctx-ckpt-i N, --ctx-checkpoints-interval N",  "minimum number of tokens between each context checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_interval});
     options.push_back({ "*",           "-ctx-ckpt-t N, --ctx-checkpoints-tolerance N", "the number of tokens before the full prompt to create the checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_tolerance});
+    options.push_back({ "*",           "-ctx-ckpt-msg N, --ctx-checkpoints-messages N", "chat requests: also checkpoint at message boundaries (end of the leading system messages and the starts of the last N messages), so a request that changes only a later message reuses everything before it (default: %d, 0 = off)",params.ctx_checkpoints_msg});
     options.push_back({ "*",           "-ctx-ckpt-e NAME, --ctx-checkpoints-eviction NAME", "Eviction strategy for checkpoint. Accepts fifo, variance and auto. Auto defaults to variance. Variance preserves coverage and maintains uniform interval.  (default: variance)" });
     options.push_back({ "*",           "-cram, --cache-ram N",          "set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)",params.cache_ram_mib });
     options.push_back({ "*",           "-crs,  --cache-ram-similarity N",           "minimum fraction of a cached entry that must match the new prompt for that entry to be reusable (default: %.2f).",params.cache_ram_similarity });
@@ -3509,6 +3677,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "main",        "       --no-prefill-assistant",  "whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)\n"
             "when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled\n" });
     options.push_back({ "grammar" });
+    options.push_back({ "server",      "       --grammar-sparse-logits N", "quillama: when the grammar allows at most N tokens next, compute only their logits\n"
+                                                                        "(same output, the output matrix is mostly not read) (default: %d, 0 = off)", params.grammar_sparse_logits });
+    options.push_back({ "server",      "       --grammar-draft N",      "quillama: draft up to N grammar-forced tokens per step and verify them in one batch;\n"
+                                                                        "the output is unchanged, JSON-schema output gets faster (default: %d, 0 = off)", params.grammar_draft_n });
     options.push_back({ "*",           "       --grammar GRAMMAR",      "BNF-like grammar to constrain generations (see samples in grammars/ dir) (default: '%s')", sparams.grammar.grammar.c_str() });
     options.push_back({ "*",           "       --grammar-file FNAME",   "file to read grammar from" });
     options.push_back({ "*",           "-j,    --json-schema SCHEMA",
@@ -3598,6 +3770,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "       --moe-cache-mib N",       "Total GPU cache budget in MiB for CPU-resident MoE experts, split across GPUs (default: 0, disabled)"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
+    options.push_back({ "*",           "       --moe-lookahead",         "quillama (experimental): run the next layer's MoE router early and read its predicted\n"
+                                                                        "experts ahead from storage (implies --prefetch-experts)"});
+    options.push_back({ "*",           "-nrtr,  --no-repack",           "quillama: do not repack the weights at load time (by default they are repacked\n"
+                                                                        "for faster CPU inference when the model fits in RAM)"});
     options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
     options.push_back({ "*",           "-dple,  --defer-ple",            "keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux, Windows)"});
     options.push_back({ "*",           "-prexp, --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});

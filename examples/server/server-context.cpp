@@ -520,6 +520,11 @@ void server_context::init() {
             /* force_pure_content    */ params_base.force_pure_content_parser
            // /* media_path            */ params_base.media_path,
         };
+        // message-boundary checkpoints only matter where the cache cannot be truncated back to a prefix
+        if (params_base.ctx_checkpoints_n > 0 &&
+            (llama_model_has_recurrent(model) || llama_kv_cache_is_compacted(ctx))) {
+            chat_params.cache_point_msgs = std::max(0, params_base.ctx_checkpoints_msg);
+        }
     }
 
 }
@@ -585,6 +590,9 @@ void server_slot::reset() {
     checkpoint_pos = -1;
     image_just_processed = false;
     do_checkpoint = false;
+    // cache_points stay: launch_slot_with_task turns them into prev_cache_points
+    cache_point_i = 0;
+    do_branch_checkpoint = false;
     do_rewind_chekpoint = false;
     if (spec != nullptr) {
         common_speculative_clear_sequence(spec, id);
@@ -1434,6 +1442,39 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     // get prompt
     if (!task.infill) {
         slot.prompt_tokens = std::move(task.tokens);
+        slot.cache_points = std::move(task.cache_points);
+        slot.cache_points_family = 0;
+        slot.prev_cache_points.clear();
+        if (!slot.cache_points.empty()) {
+            ++branch_n_requests;
+            // FNV-1a over the tokens before the first boundary (the system prompt)
+            const int32_t n_key = slot.cache_points.front().n_tokens;
+            uint64_t h = 1469598103934665603ULL;
+            for (int32_t i = 0; i < n_key; ++i) {
+                h = (h ^ (uint32_t) slot.prompt_tokens[i]) * 1099511628211ULL;
+            }
+            slot.cache_points_family = h;
+            if (branch_families.size() >= 256 && branch_families.count(h) == 0) {
+                // forget the family seen longest ago
+                auto oldest = branch_families.begin();
+                for (auto it = branch_families.begin(); it != branch_families.end(); ++it) {
+                    if (it->second.seen < oldest->second.seen) {
+                        oldest = it;
+                    }
+                }
+                branch_families.erase(oldest);
+            }
+            auto & fam = branch_families[h];
+            slot.prev_cache_points = std::move(fam.points);
+            fam.points.clear();
+            for (const auto & pt : slot.cache_points) {
+                fam.points.push_back({ pt, slot.prompt_tokens[pt.n_tokens - 1], slot.prompt_tokens[pt.n_tokens] });
+            }
+            fam.seen = branch_n_requests;
+        }
+        slot.cache_point_i = 0;
+        slot.cache_points_n_prompt = slot.prompt_tokens.size();
+        slot.do_branch_checkpoint = false;
 
         const auto & prompt = data.find("prompt");
         if (prompt != data.end()) {
@@ -2784,11 +2825,17 @@ void server_context::split_multiprompt_task(int id_multi, server_task& multiprom
 
 
 
+// Slot-file checkpoint appendix. Per record: pos_min, pos_max, two legacy llama_pos fields, data_len,
+// data. quillama stores n_tokens in the first legacy field (0 in older files: then pos_max + 1 is
+// used). Returns the bytes written, or 0 when nothing could be written completely.
 static size_t save_checkpoints_to_file(const std::string & filename, const std::list<server_prompt_checkpoint> & checkpoints) {
     if (checkpoints.size() == 0) {
         return 0;
     }
     std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        return 0;
+    }
     uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
     file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
     uint32_t version = LLAMA_STATE_SEQ_VERSION;
@@ -2799,61 +2846,91 @@ static size_t save_checkpoints_to_file(const std::string & filename, const std::
     for (const auto & checkpoint : checkpoints) {
         file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
         file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
-        file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
+        llama_pos n_tokens_field = (llama_pos) std::min<int64_t>(std::max<int64_t>(checkpoint.n_tokens, 0), INT32_MAX);
+        llama_pos legacy_field   = 0;
+        file.write(reinterpret_cast<const char *>(&n_tokens_field), sizeof(n_tokens_field));
+        file.write(reinterpret_cast<const char *>(&legacy_field), sizeof(legacy_field));
         size_t data_len = checkpoint.data.size();
         file.write(reinterpret_cast<const char *>(&data_len), sizeof(data_len));
         if (data_len > 0) {
             file.write(reinterpret_cast<const char *>(checkpoint.data.data()), data_len * sizeof(uint8_t));
         }
     }
+    file.flush();
+    if (!file.good()) {
+        file.close();
+        remove(filename.c_str());
+        return 0;
+    }
     size_t pos = file.tellp();
     file.close();
     return pos;
 }
 
-static size_t load_checkpoints_from_file(const std::string & filename, std::list<server_prompt_checkpoint> & checkpoints) {
-    std::ifstream file(filename, std::ios::binary);
+// Reads a checkpoint appendix. Every size is bounded by the bytes left in the file, so a truncated or
+// corrupt file is rejected (returns 0, no checkpoints) instead of allocating an arbitrary amount of
+// memory or keeping garbage; the slot then falls back to reprocessing the prompt. With max_keep > 0
+// only the newest max_keep checkpoints are kept.
+static size_t load_checkpoints_from_file(const std::string & filename, std::list<server_prompt_checkpoint> & checkpoints, size_t max_keep = 0) {
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return 0;
     }
     clear_checkpoints_and_spill(checkpoints);
-    // version checks
-    {
-        uint32_t magic;
-        file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
-        uint32_t version;
-        file.read(reinterpret_cast<char *>(&version), sizeof(version));
-
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
-            LLAMA_LOG_ERROR("%s: unknown (magic, version) for checkpoint file: %08x, %08x\n", __func__, magic, version);
+    const std::streamoff file_size = file.tellg();
+    file.seekg(0);
+    auto remaining = [&]() -> uint64_t {
+        const std::streamoff cur = file.tellg();
+        return cur < 0 || cur > file_size ? 0 : (uint64_t) (file_size - cur);
+    };
+    auto read = [&](void * dst, size_t n) {
+        if (remaining() < n) {
+            return false;
+        }
+        file.read(reinterpret_cast<char *>(dst), n);
+        return (bool) file;
+    };
+    uint32_t magic = 0, version = 0;
+    if (!read(&magic, sizeof(magic)) || !read(&version, sizeof(version)) ||
+        magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        LLAMA_LOG_ERROR("%s: unknown (magic, version) for checkpoint file: %08x, %08x\n", __func__, magic, version);
+        return 0;
+    }
+    constexpr size_t record_header = 4*sizeof(llama_pos) + sizeof(size_t);
+    size_t count = 0;
+    if (!read(&count, sizeof(count)) || count > remaining() / record_header) {
+        LLAMA_LOG_ERROR("%s: invalid checkpoint count in %s\n", __func__, filename.c_str());
+        return 0;
+    }
+    std::list<server_prompt_checkpoint> loaded;
+    for (size_t i = 0; i < count; i++) {
+        server_prompt_checkpoint checkpoint;
+        llama_pos n_tokens_field = 0, legacy_field = 0;
+        size_t data_len = 0;
+        bool ok = read(&checkpoint.pos_min, sizeof(checkpoint.pos_min)) &&
+                  read(&checkpoint.pos_max, sizeof(checkpoint.pos_max)) &&
+                  read(&n_tokens_field, sizeof(n_tokens_field)) &&
+                  read(&legacy_field, sizeof(legacy_field)) &&
+                  read(&data_len, sizeof(data_len));
+        // a checkpoint always holds a state: an empty blob would roll back without restoring anything
+        ok = ok && data_len > 0 && data_len <= remaining() && checkpoint.pos_min <= checkpoint.pos_max;
+        if (ok) {
+            checkpoint.data.resize(data_len);
+            ok = read(checkpoint.data.data(), data_len);
+        }
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: truncated or corrupt checkpoint %zu of %zu in %s, ignoring the checkpoints\n", __func__, i, count, filename.c_str());
             return 0;
         }
-    }
-    // load the checkpoints
-    {
-        size_t count;
-        file.read(reinterpret_cast<char *>(&count), sizeof(count));
-
-        for (size_t i = 0; i < count; i++) {
-            server_prompt_checkpoint checkpoint;
-            file.read(reinterpret_cast<char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
-            file.read(reinterpret_cast<char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
-            // n_tokens occupies the same 8-byte slot as the old-format legacy
-            // pos_min_prompt/pos_max_prompt pair; files saved before this change
-            // read back n_tokens = 0
-            file.read(reinterpret_cast<char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
-
-            size_t data_len;
-            file.read(reinterpret_cast<char *>(&data_len), sizeof(data_len));
-            if (data_len > 0) {
-                checkpoint.data.resize(data_len);
-                file.read(reinterpret_cast<char *>(checkpoint.data.data()), data_len * sizeof(uint8_t));
-            }
-            checkpoints.push_back(checkpoint);
+        checkpoint.n_tokens = n_tokens_field > 0 ? n_tokens_field : (int64_t) checkpoint.pos_max + 1;
+        loaded.push_back(std::move(checkpoint));
+        if (max_keep > 0 && loaded.size() > max_keep) {
+            loaded.pop_front();
         }
     }
     size_t pos = file.tellg();
     file.close();
+    checkpoints = std::move(loaded);
     return pos;
 }
 
@@ -3114,7 +3191,34 @@ void server_context::process_single_task(server_task&& task) {
         std::string filepath = task.data.at("filepath");
         save_server_tokens_to_file(filepath+".tokens.json", slot->cache_tokens);
         create_checkpoint(*slot);
-        size_t saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
+        size_t saved = 0;
+        if (!slot->server_cached_prompt.checkpoints.empty()) {
+            // spilled checkpoints have no data in memory: read their blob back for the save,
+            // then drop it again (the spill file stays valid)
+            std::vector<server_prompt_checkpoint *> reloaded;
+            bool all_present = true;
+            for (auto & ckpt : slot->server_cached_prompt.checkpoints) {
+                if (ckpt.data.empty() && !ckpt.spill_path.empty()) {
+                    if (load_spilled_checkpoint(ckpt)) {
+                        reloaded.push_back(&ckpt);
+                    }
+                }
+                all_present = all_present && !ckpt.data.empty();
+            }
+            if (all_present) {
+                saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
+            }
+            for (auto * ckpt : reloaded) {
+                ckpt->data.clear();
+                ckpt->data.shrink_to_fit();
+            }
+            if (saved == 0) {
+                send_error(task, "Unable to write the context checkpoints of the slot save file", ERROR_TYPE_SERVER);
+                break;
+            }
+        } else {
+            remove((filepath + ".checkpoints").c_str()); // no stale checkpoints from an older save
+        }
 
         const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
 
@@ -3163,7 +3267,11 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
         load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
-        size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
+        size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints,
+                                                   params_base.ctx_checkpoints_n > 0 ? (size_t) params_base.ctx_checkpoints_n : 0);
+        if (loaded > 0) {
+            SLT_INF(*slot, "restored %zu context checkpoints from %s.checkpoints\n", slot->server_cached_prompt.checkpoints.size(), filename.c_str());
+        }
 
         const int64_t t_end = ggml_time_us();
         const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3652,6 +3760,37 @@ void server_context::context_shift() {
     }
 }
 
+// quillama.cpp: tokens the slot's grammar forces next, to be verified in one batch (see
+// common_sampler_grammar_draft). Only without another speculative method and only for models whose
+// KV cache can drop a rejected tail (no recurrent state).
+std::vector<llama_token> server_context::grammar_draft(server_slot & slot) {
+    if (params_base.grammar_draft_n <= 0 || slot.can_speculate() || !slot.ctx_sampling || !slot.ctx_sampling->grammar) {
+        return {};
+    }
+    if (mctx || common_speculative_needs_checkpoint(model)) {
+        return {};
+    }
+    // adaptive: a rejected draft row costs about as much as an accepted one saves, and on CPU the
+    // break-even is near 60% acceptance (measured on a Qwen3-30B-A3B-shaped MoE). Once a request has
+    // drafted enough tokens, stop drafting for it when too few were accepted (the model prefers
+    // other tokenizations of the forced text). QUILL_GRAMMAR_DRAFT_MIN_ACCEPT overrides (0 = never stop).
+    static const float min_accept = [] {
+        const char * e = getenv("QUILL_GRAMMAR_DRAFT_MIN_ACCEPT");
+        return e ? (float) atof(e) : 0.6f;
+    }();
+    if (min_accept > 0.0f && slot.n_draft_total >= 16 && slot.n_draft_accepted < min_accept * slot.n_draft_total) {
+        return {};
+    }
+    int n_max = std::min(params_base.grammar_draft_n, slot.n_ctx - slot.n_past - 2);
+    if (slot.n_remaining > 0) {   // set by has_budget(): request or server n_predict
+        n_max = std::min(n_max, slot.n_remaining - 1);
+    }
+    if (n_max <= 0) {
+        return {};
+    }
+    return common_sampler_grammar_draft(slot.ctx_sampling, ctx, n_max);
+}
+
 void server_context::add_sampled_tokens() {
     for (auto& slot : slots) {
         slot.released = false;
@@ -3749,6 +3888,20 @@ void server_context::add_sampled_tokens() {
                 slot.draft_proposal_dists = std::move(proposal_dists);
             }
         }
+        else if (auto gdraft = grammar_draft(slot); !gdraft.empty()) {
+            // quillama.cpp: grammar jump-forward, verified like any other draft
+            slot.i_batch_dft.push_back(batch.n_tokens);
+            common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
+            slot.cache_tokens.push_back(slot.sampled);
+            slot.n_draft_total += gdraft.size();
+            for (size_t i = 0; i < gdraft.size(); i++) {
+                slot.i_batch_dft.push_back(batch.n_tokens);
+                common_batch_add(batch, gdraft[i], slot.cache_tokens.pos_next(), { slot.id }, true);
+                slot.cache_tokens.push_back(gdraft[i]);
+            }
+            slot.drafted = std::move(gdraft);
+            slot.draft_proposal_dists.clear();
+        }
         else {
             // no speculative decoding
             slot.i_batch = batch.n_tokens;
@@ -3779,6 +3932,89 @@ static bool verify_restored_checkpoint(
         return false;
     }
     return true;
+}
+
+// a boundary has to save at least this many tokens over the checkpoint the request would use instead
+static constexpr int32_t kMinBranchGain = 128;
+// the learned boundary kind is dropped after this many chat requests without a hit
+static constexpr int64_t kBranchMemory = 16;
+
+// Called with the length of the prefix the new prompt shares with the slot's cache (which may
+// have just been restored from the RAM prompt cache), before a checkpoint is restored. If the
+// cache holds the previous prompt of the same family (same system prompt), and that prompt had a
+// boundary inside the shared prefix at least kMinBranchGain tokens past the checkpoint the
+// request can resume from (not counting one taken at that boundary), a checkpoint there pays off
+// for this family: remember the boundary's kind. Only that one kind is used for the family, until
+// another kind is seen or kBranchMemory requests pass without a hit. Until then prompts are split
+// exactly as without the option, so a layout that never diverges at a boundary loses no
+// batch-end checkpoint to it (one moved split cannot serve two kinds anyway).
+void server_context::learn_branch_points(server_slot & slot, int32_t n_common) {
+    const server_cache_point * best = nullptr;
+    for (const auto & p : slot.prev_cache_points) {
+        const int32_t b = p.pt.n_tokens;
+        if (b > n_common || b >= (int32_t) slot.cache_tokens.size() ||
+            slot.cache_tokens[b - 1] != p.before || slot.cache_tokens[b] != p.at) {
+            continue; // past the divergence, or the slot's cache holds a different prompt now
+        }
+        if (best == nullptr || b > best->n_tokens) {
+            best = &p.pt;
+        }
+    }
+    if (best == nullptr) {
+        return;
+    }
+    int64_t resume = 0;
+    for (const auto & c : slot.server_cached_prompt.checkpoints) {
+        if (c.n_tokens <= n_common && c.n_tokens != best->n_tokens) {
+            resume = std::max<int64_t>(resume, c.n_tokens);
+        }
+    }
+    if (best->n_tokens - resume >= kMinBranchGain) {
+        auto fam = branch_families.find(slot.cache_points_family);
+        if (fam != branch_families.end()) {
+            fam->second.kind = best->kind;
+            fam->second.hit  = branch_n_requests;
+        }
+    }
+}
+
+// A branch point is a message boundary the prompt has just reached (n_in_batch of this slot's
+// prompt tokens are in the current batch). Ending the batch there costs an extra pass over the
+// weights if it adds a ubatch, and on MoE models a small ubatch costs nearly as much as a full
+// one, so the batch is only ended where the prompt still needs the same number of ubatches: the
+// split moves, it is not added. It is also skipped unless it saves real work: kMinBranchGain
+// tokens past the newest checkpoint, and that many before the prompt-end checkpoint.
+bool server_context::is_branch_point(server_slot & slot, int32_t n_in_batch) const {
+    if (slot.cache_points.empty() || slot.truncated || slot.cache_points_n_prompt != slot.n_prompt_tokens) {
+        return false;
+    }
+    const int32_t n = slot.n_past_prompt;
+    while (slot.cache_point_i < slot.cache_points.size() && slot.cache_points[slot.cache_point_i].n_tokens < n) {
+        ++slot.cache_point_i;
+    }
+    if (slot.cache_point_i >= slot.cache_points.size() || slot.cache_points[slot.cache_point_i].n_tokens != n) {
+        return false;
+    }
+    const int32_t kind = slot.cache_points[slot.cache_point_i].kind;
+    ++slot.cache_point_i;
+    // only the boundary kind where a request of this prompt family recently diverged
+    const auto fam = branch_families.find(slot.cache_points_family);
+    if (fam == branch_families.end() || kind != fam->second.kind || branch_n_requests - fam->second.hit > kBranchMemory) {
+        return false;
+    }
+    const auto & ckpts = slot.server_cached_prompt.checkpoints;
+    const int64_t last = ckpts.empty() ? 0 : ckpts.back().n_tokens;
+    if (n - last < kMinBranchGain || slot.n_prompt_tokens - n < kMinBranchGain) {
+        return false;
+    }
+    // ubatches needed for the rest of the prompt (up to the prompt-end split) with and without
+    // ending the batch here
+    const int64_t u   = std::max<int64_t>(1, std::min<int64_t>(llama_n_ubatch(ctx), (int64_t) llama_n_batch(ctx)));
+    const int64_t tol = params_base.ctx_checkpoints_tolerance > 0 ? params_base.ctx_checkpoints_tolerance : 0;
+    const int64_t s   = n - n_in_batch;                  // prompt index where this batch started
+    const int64_t e   = std::max<int64_t>(n, slot.n_prompt_tokens - tol);
+    auto n_ub = [u](int64_t len) { return (len + u - 1) / u; };
+    return n_ub(n - s) + n_ub(e - n) == n_ub(e - s);
 }
 
 void server_context::create_checkpoint_at_interval(server_slot & slot) {
@@ -4199,6 +4435,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             // reuse any previously computed tokens that are common with the new prompt
                             common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens);
                             LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d\n", (int32_t)slot.cache_tokens.size(),  (int32_t)prefix.first, (int32_t)prefix.second);
+                            if (params_base.do_checkpoint) {
+                                learn_branch_points(slot, prefix.first);
+                            }
                             int32_t size_threshold = 20;
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
@@ -4387,6 +4626,10 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         slot.do_checkpoint = true;
                         break;
                     }
+                    if (params_base.do_checkpoint && is_branch_point(slot, batch.n_tokens - prompt_batch_i0)) {
+                        slot.do_branch_checkpoint = true;
+                        break;
+                    }
                     if (slot.n_prompt_tokens - slot.n_past_prompt == 1) {
                         if (slot.n_buffer > 0 && llama_model_has_recurrent(llama_get_model(slot.ctx))) {
                             slot.do_rewind_chekpoint = true;
@@ -4547,7 +4790,10 @@ void server_context::speculative_decoding_accept() {
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
-        if (!common_speculative_commit(
+        if (!slot.spec) {
+            // grammar jump-forward draft (no speculative context): drop the rejected tail from the KV cache
+            llama_kv_cache_seq_rm(ctx, slot.id, spec_pos_base + (llama_pos) (ids.size() - 1), -1);
+        } else if (!common_speculative_commit(
             slot.spec,
             ctx,
             slot.ctx_sampling,
@@ -4930,6 +5176,79 @@ void server_context::update_allowlist_state(server_slot& slot) {
     }
 }
 
+// quillama.cpp: when this batch has a single output row and the slot sampling it has a grammar that
+// allows only a few tokens next (structural JSON: braces, quotes, keys, digits, enum values), compute
+// only those logits (see llama_set_logit_subset). The grammar masks every other token anyway, so the
+// sampled token is unchanged; most of the output matrix is not read.
+// quillama.cpp: when every output row of this batch view belongs to a grammar-constrained slot that
+// allows only a few tokens next, compute the output layer only for the union of those tokens (exact:
+// every other logit would be masked to -inf). Covers single-token decode and the verification rows
+// of a grammar jump-forward draft (row i is checked against the grammar after draft[0..i-1]).
+bool server_context::set_grammar_logit_subset(const llama_batch & batch_view, int32_t offset) {
+    if (params_base.grammar_sparse_logits <= 0) {
+        return false;
+    }
+    int32_t n_out = 0;
+    for (int32_t k = 0; k < batch_view.n_tokens; ++k) {
+        n_out += batch_view.logits[k] ? 1 : 0;
+    }
+    if (n_out == 0 || n_out > 64) {
+        return false;
+    }
+    const auto in_view = [&](int32_t idx) {
+        return idx >= offset && idx < offset + batch_view.n_tokens && batch_view.logits[idx - offset];
+    };
+    const size_t max_n = (size_t) params_base.grammar_sparse_logits;
+    thread_local std::vector<llama_token> allowed;
+    allowed.clear();
+    int32_t n_covered = 0;
+    for (auto & slot : slots) {
+        if (slot.state != SLOT_STATE_PROCESSING) {
+            continue;
+        }
+        if (slot.i_batch_dft.empty()) {
+            if (!in_view(slot.i_batch)) {
+                continue;
+            }
+            if (!slot.ctx_sampling || (slot.n_decoded == 0 && slot.n_past == 0)) {
+                return false;
+            }
+            thread_local std::vector<llama_token> row;
+            if (!common_sampler_grammar_allowed_set(slot.ctx_sampling, ctx, max_n, row)) {
+                return false;
+            }
+            allowed.insert(allowed.end(), row.begin(), row.end());
+            n_covered += 1;
+            continue;
+        }
+        int32_t n_rows = 0;
+        for (const int32_t idx : slot.i_batch_dft) {
+            n_rows += in_view(idx) ? 1 : 0;
+        }
+        if (n_rows == 0) {
+            continue;
+        }
+        // only grammar drafts (another speculative method may need the full distribution), all rows here
+        if (slot.can_speculate() || !slot.draft_proposal_dists.empty() || !slot.ctx_sampling ||
+            n_rows != (int32_t) slot.i_batch_dft.size() || slot.i_batch_dft.size() != slot.drafted.size() + 1) {
+            return false;
+        }
+        if (!common_sampler_grammar_allowed_union(slot.ctx_sampling, ctx, max_n, slot.drafted, allowed)) {
+            return false;
+        }
+        n_covered += n_rows;
+    }
+    if (n_covered != n_out) {
+        return false;   // an output row we cannot bound
+    }
+    std::sort(allowed.begin(), allowed.end());
+    allowed.erase(std::unique(allowed.begin(), allowed.end()), allowed.end());
+    if (allowed.empty() || allowed.size() > max_n) {
+        return false;
+    }
+    llama_set_logit_subset(ctx, allowed.data(), (int32_t) allowed.size());
+    return true;
+}
 
 void server_context::process_batch_tokens(int32_t & n_batch) {
     for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
@@ -4948,7 +5267,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
+        const bool sparse_logits = set_grammar_logit_subset(batch_view, i);
         const int ret = server_decode(ctx, batch_view);
+        if (sparse_logits) {
+            llama_set_logit_subset(ctx, nullptr, 0);
+        }
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
@@ -5024,7 +5347,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (!is_active_slot || slot.i_batch < (int)i || slot.i_batch >= (int)(i + n_tokens)) {
                 // save checkpoint during prompt processing
                 if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
-                    if (slot.do_checkpoint) {
+                    if (slot.do_branch_checkpoint) {
+                        slot.do_branch_checkpoint = false;
+                        if (create_checkpoint(slot)) {
+                            slot.checkpoint_pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+                        }
+                    } else if (slot.do_checkpoint) {
                         create_checkpoint(slot, true);
                        
                     } else {

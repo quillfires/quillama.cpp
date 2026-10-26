@@ -507,6 +507,196 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+// quillama.cpp: grammar jump-forward drafting.
+// Walk the grammar from its current state while every parse stack agrees on one single next
+// character; that text is forced, whatever the model would prefer. Its tokenization is returned as
+// a speculative draft, which the normal grammar-constrained sampling then verifies, so the output
+// is unchanged while runs of forced JSON (keys, quotes, braces, enum prefixes) cost one batched
+// forward pass instead of one pass per token.
+static void quill_append_utf8(std::string & out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += (char) cp;
+    } else if (cp < 0x800) {
+        out += (char) (0xC0 | (cp >> 6));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char) (0xE0 | (cp >> 12));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else {
+        out += (char) (0xF0 | (cp >> 18));
+        out += (char) (0x80 | ((cp >> 12) & 0x3F));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    }
+}
+
+static bool grammar_should_apply(struct common_sampler * gsmpl);
+
+bool common_sampler_grammar_allowed_set(struct common_sampler * gsmpl, struct llama_context * ctx, size_t max_n,
+                                        std::vector<llama_token> & out) {
+    out.clear();
+    if (!gsmpl || !gsmpl->grammar || !grammar_should_apply(gsmpl)) {
+        return false;
+    }
+    // reasoning-budget forcing and requested token probabilities need the full logits
+    if (gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
+        return false;
+    }
+    if (gsmpl->params.n_probs > 0) {
+        return false;
+    }
+    return llama_grammar_small_allowed_set(gsmpl->grammar, llama_get_model_vocab(llama_get_model(ctx)), max_n, out);
+}
+
+bool common_sampler_grammar_allowed_union(struct common_sampler * gsmpl, struct llama_context * ctx, size_t max_n,
+                                          const std::vector<llama_token> & draft, std::vector<llama_token> & out) {
+    std::vector<llama_token> row;
+    if (!common_sampler_grammar_allowed_set(gsmpl, ctx, max_n, row)) {
+        return false;
+    }
+    out.insert(out.end(), row.begin(), row.end());
+    if (draft.empty()) {
+        return true;
+    }
+    const llama_vocab * vocab = llama_get_model_vocab(llama_get_model(ctx));
+    llama_grammar * clone = llama_grammar_clone_impl(*gsmpl->grammar);
+    bool ok = true;
+    for (size_t i = 0; i < draft.size() && ok; ++i) {
+        try {
+            llama_grammar_accept_token(clone, ctx, draft[i]);
+        } catch (const std::exception &) {
+            break; // the draft is rejected here: the rows after it are never used
+        }
+        if (clone->stacks.empty()) {
+            break;
+        }
+        ok = llama_grammar_small_allowed_set(clone, vocab, max_n, row);
+        out.insert(out.end(), row.begin(), row.end());
+        ok = ok && out.size() <= 4*max_n;
+    }
+    llama_grammar_free_impl(clone);
+    return ok;
+}
+
+std::string common_sampler_grammar_forced_text(struct common_sampler * gsmpl, size_t max_chars) {
+    std::string out;
+    if (!gsmpl || !gsmpl->grammar || max_chars == 0) {
+        return out;
+    }
+    const llama_grammar * g = gsmpl->grammar;
+    if ((g->lazy && g->awaiting_trigger) || g->partial_utf8.n_remain != 0 || !grammar_should_apply(gsmpl)) {
+        return out;
+    }
+    llama_grammar * clone = llama_grammar_clone_impl(*g);
+    for (size_t n = 0; n < max_chars; ++n) {
+        const auto & stacks = clone->stacks;
+        if (stacks.empty()) {
+            break;
+        }
+        uint32_t forced = 0;
+        bool ok = true;
+        for (const auto & stack : stacks) {
+            if (stack.empty()) { ok = false; break; }             // the grammar may end here
+            const llama_grammar_element * pos = stack.back();
+            if (pos->type != LLAMA_GRETYPE_CHAR) { ok = false; break; }
+            const auto next = pos[1].type;
+            if (next == LLAMA_GRETYPE_CHAR_ALT || next == LLAMA_GRETYPE_CHAR_RNG_UPPER) { ok = false; break; }
+            if (pos->value == 0 || (forced != 0 && forced != pos->value)) { ok = false; break; }
+            forced = pos->value;
+        }
+        if (!ok || forced == 0) {
+            break;
+        }
+        quill_append_utf8(out, forced);
+        llama_grammar_accept(clone, forced);
+    }
+    llama_grammar_free_impl(clone);
+    return out;
+}
+
+std::vector<llama_token> common_sampler_grammar_draft(struct common_sampler * gsmpl, struct llama_context * ctx, int n_max) {
+    std::vector<llama_token> draft;
+    if (n_max <= 0) {
+        return draft;
+    }
+    const std::string forced = common_sampler_grammar_forced_text(gsmpl, 8*(size_t)n_max);
+    if (forced.empty()) {
+        return draft;
+    }
+    draft = common_tokenize(ctx, forced, false, false);
+    // the last token may merge with the free text that follows, so it is not a reliable guess
+    if (!draft.empty()) {
+        draft.pop_back();
+    }
+    if ((int) draft.size() > n_max) {
+        draft.resize(n_max);
+    }
+    return draft;
+}
+
+// quillama.cpp: grammar masking restricted to the candidates that can matter.
+// Masking the whole vocabulary (150k+ tokens) costs tens of ms per token on CPU. When the sampler
+// is greedy, or its first active step is top-k, only the k highest-logit grammar-valid tokens can
+// be sampled; they are found by scanning the candidates in descending logit order, in growing
+// chunks, until k valid ones are found. Grammar rejection is per token, so the result is identical
+// to masking everything and then applying top-k.
+static size_t grammar_topk_need(const common_sampler * s) {
+    // exact, but measured no faster than the (now cheap) full mask on CPU: opt-in
+    static const bool enabled = [] { const char * e = getenv("QUILL_GRAMMAR_TOPK"); return e && atoi(e) != 0; }();
+    const auto & p = s->params;
+    if (!enabled) return 0;
+    if (p.temp <= 0.0f) return 1;                                          // greedy
+    if (p.mirostat != 0) return 0;
+    if (p.adaptive_target >= 0.0f && s->adapt_p_ctx != nullptr) return 0;
+    for (auto t : p.samplers_sequence) {
+        if (t == llama_sampler_type::DRY) {
+            if (p.dry_multiplier != 0.0f && s->smpl) return 0;
+            continue;
+        }
+        if (t == llama_sampler_type::TOP_K) return p.top_k > 0 ? (size_t) p.top_k : 0;
+        return 0;
+    }
+    return 0;
+}
+
+static void grammar_apply_topk(common_sampler * s, llama_context * ctx, llama_token_data_array & cur_p, size_t need) {
+    llama_token_data * data = cur_p.data;
+    const size_t n = cur_p.size;
+    auto by_logit = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+    size_t start = 0, n_valid = 0;
+    size_t chunk = std::max<size_t>(64, 2*need);
+    while (start < n && n_valid < need) {
+        // past a few thousand candidates, mask the whole remainder in one call instead of sorting more
+        const size_t end = start >= 4096 ? n : std::min(n, start + chunk);
+        if (end == n && start > 0) {
+            llama_token_data_array rest = { data + start, n - start, false };
+            llama_grammar_apply(s->grammar, ctx, &rest);
+            for (size_t i = start; i < n; ++i) {
+                if (data[i].logit != -INFINITY) data[n_valid++] = data[i];
+            }
+            std::sort(data, data + n_valid, by_logit);
+            start = n;
+            break;
+        }
+        std::partial_sort(data + start, data + end, data + n, by_logit);
+        llama_token_data_array sub = { data + start, end - start, true };
+        llama_grammar_apply(s->grammar, ctx, &sub);
+        // compact the valid ones (still in descending order) to the front
+        for (size_t i = start; i < end; ++i) {
+            if (data[i].logit != -INFINITY) data[n_valid++] = data[i];
+        }
+        start = end;
+        chunk *= 4;
+    }
+    cur_p.size   = n_valid;
+    cur_p.sorted = true;
+    if (n_valid == 0) {
+        // nothing valid: keep one -inf candidate so the samplers do not see an empty array
+        cur_p.size = 1;
+    }
+}
+
 static llama_token llama_sampling_sample_impl(
                   struct common_sampler * ctx_sampling,
                   struct llama_context * ctx_main,
@@ -535,8 +725,12 @@ static llama_token llama_sampling_sample_impl(
     common_reasoning_budget_apply(rbudget, &cur_p);
     // Sample grammar first for resampling
     if (ctx_sampling->grammar != NULL && grammar_first && grammar_should_apply(ctx_sampling)) {
-        // Apply grammar constraints to all candidates
-        llama_grammar_apply(ctx_sampling->grammar, ctx_main, &cur_p);
+        if (const size_t need = grammar_topk_need(ctx_sampling); need > 0) {
+            grammar_apply_topk(ctx_sampling, ctx_main, cur_p, need);
+        } else {
+            // Apply grammar constraints to all candidates
+            llama_grammar_apply(ctx_sampling->grammar, ctx_main, &cur_p);
+        }
     }
 
     // llama_sampler_apply
@@ -691,7 +885,8 @@ static llama_token_data_array llama_sampling_prepare_impl(
     }
 
     // apply grammar checks before sampling logic
-    if (grammar_first && ctx_sampling->grammar != NULL) {
+    // (the sampling itself masks again, restricted to the top candidates when possible: see grammar_topk_need)
+    if (grammar_first && ctx_sampling->grammar != NULL && grammar_should_apply(ctx_sampling) && grammar_topk_need(ctx_sampling) == 0) {
         llama_grammar_apply(ctx_sampling->grammar, ctx_main, &cur_p);
     }
 
@@ -742,6 +937,17 @@ void common_sampler_accept(
     const auto accept_grammar = is_generated && grammar_should_apply(ctx_sampling);
     if (ctx_sampling->rbudget && is_generated) {
         common_reasoning_budget_accept(ctx_sampling->rbudget, token);
+
+        // if reasoning just ended, replay the end sequence into the grammar: a lazy grammar
+        // did not see it while reasoning was active, and it may carry the grammar trigger
+        const bool is_done = common_reasoning_budget_get_state(ctx_sampling->rbudget) == REASONING_BUDGET_DONE;
+        if (ctx_sampling->grammar && !accept_grammar && is_done) {
+            if (const auto * end_seq = common_reasoning_budget_get_end_match(ctx_sampling->rbudget)) {
+                for (const llama_token end_token : *end_seq) {
+                    llama_grammar_accept_token(ctx_sampling->grammar, ctx_main, end_token);
+                }
+            }
+        }
     }
 
     if (ctx_sampling->grammar && accept_grammar) {
@@ -798,6 +1004,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -806,7 +1014,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        // do not accept draft tokens after an EOG: they are not output but would stay in the context
+        // (as upstream llama.cpp #29638); a trailing EOG sampled from the target is still accepted
+        if (draft[i] != id || llama_vocab_is_eog(vocab, id)) {
             break;
         }
     }
@@ -836,6 +1046,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     result.reserve(idxs.size());
 
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const auto emit = [&](llama_token id) {
         gsmpl->playing_text += common_token_to_piece(ctx, id, true);
         common_sampler_accept(gsmpl, ctx, id, true);
@@ -869,6 +1080,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const float q_draft = q_prob(draft[i]);
         if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
             emit(draft[i]);
+            if (llama_vocab_is_eog(vocab, draft[i])) {
+                // nothing after an EOG is output: stop here instead of keeping later drafts in the context
+                return result;
+            }
             continue;
         }
 
